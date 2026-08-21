@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HairyMess — WebGPU hair simulation</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="gpu-canvas"></canvas>
+
+    <div id="hud">
+      <div id="fps">--</div>
+      <div id="gpu-stats"></div>
+    </div>
+
+    <pre id="info">
+Drag: orbit   Wheel: zoom   Shift-drag: pan
+Num Particles:   <span id="num-particles">-</span>
+Num Hairstrands: <span id="num-strands">-</span>
+
+///////  ///////     Furry Ball
+//   //  //          patrickfuerst.at
+//////   ////
+//       //
+//       //</pre>
+
+    <div id="banner" hidden>
+      <div class="banner-box">
+        <h1>WebGPU required</h1>
+        <p id="banner-message">
+          This demo runs on WebGPU compute shaders. Please use a current version of
+          Chrome, Edge, Safari 26+ or Firefox 141+.
+        </p>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "name": "hairymess-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "WebGPU port of HairyMess — GPU compute-shader hair simulation (patrickfuerst.at)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "bake": "python3 tools/bake_dae.py"
+  },
+  "dependencies": {
+    "lil-gui": "^0.20.0",
+    "wgpu-matrix": "^3.4.0"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.64",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.2"
+  }
+}

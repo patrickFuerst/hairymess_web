@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "vertexCount": 17365,
+  "indexCount": 104664,
+  "jointCount": 65,
+  "frameCount": 52,
+  "duration": 1.7,
+  "modelMatrix": [
+    3.563140788689157,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    -3.563140788689157,
+    0.0,
+    0.0,
+    3.563140788689157,
+    0.0,
+    0.0,
+    -0.1803357169819889,
+    2.1752710944351823,
+    3.0528788354938743,
+    1.0
+  ],
+  "buffers": {
+    "positions": {
+      "offset": 0,
+      "length": 208380
+    },
+    "normals": {
+      "offset": 208380,
+      "length": 208380
+    },
+    "indices": {
+      "offset": 416760,
+      "length": 418656
+    },
+    "joints": {
+      "offset": 835416,
+      "length": 138920
+    },
+    "weights": {
+      "offset": 974336,
+      "length": 277840
+    },
+    "palettes": {
+      "offset": 1252176,
+      "length": 216320
+    }
+  }
+}
