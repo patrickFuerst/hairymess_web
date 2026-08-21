@@ -3,10 +3,13 @@
 
 @group(0) @binding(0) var<uniform> u: SimUniforms;
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
-@group(0) @binding(2) var<storage, read> strandLengths: array<f32>;
-@group(0) @binding(3) var<storage, read> roots: array<vec4f>;   // model space (skinning output)
-@group(0) @binding(4) var<storage, read> velocityGrid: array<vec4f>;
-@group(0) @binding(5) var<storage, read> gradientGrid: array<vec4f>;
+// roots: model space (skinning output). w carries the strand's rest length, packed in
+// at build time and preserved by the skinning pass — it used to be its own binding.
+@group(0) @binding(2) var<storage, read> roots: array<vec4f>;
+@group(0) @binding(3) var<storage, read> velocityGrid: array<vec4f>;
+@group(0) @binding(4) var<storage, read> gradientGrid: array<vec4f>;
+// the fill pass's atomic density buffer, viewed as plain i32 for the self-shadow taps
+@group(0) @binding(5) var<storage, read> densityI: array<i32>;
 
 var<workgroup> sharedPos: array<vec4f, WORK_GROUP_SIZE>;
 var<workgroup> sharedFix: array<u32, WORK_GROUP_SIZE>;
@@ -80,6 +83,66 @@ fn positionIntegration(pos: vec3f, vel: vec3f) -> vec3f {
        + u.gravity.xyz * u.deltaTime * u.deltaTime;
 }
 
+// ---------------------------------------------------------------- body collision
+
+/**
+ * Runs every world-space capsule against the particle, in the same place the ground
+ * plane collision runs. `pos`/`vel` are world space; fixed particles never call this.
+ */
+fn resolveColliders(pos: vec3f, vel: vec3f) -> CollisionResult {
+  var r: CollisionResult;
+  r.pos = pos;
+  r.vel = vel;
+  r.dragged = 0.0;
+  let n = min(u.colliderCount, MAX_COLLIDERS);
+  for (var i = 0u; i < n; i = i + 1u) {
+    var c: Capsule;
+    c.a = u.colliderA[i].xyz;
+    c.radius = u.colliderA[i].w;
+    c.b = u.colliderB[i].xyz;
+    c.hasVelocity = u.colliderB[i].w;
+    c.vel = u.colliderVel[i].xyz;
+    let hit = resolveCapsule(c, r.pos, r.vel);
+    r.pos = hit.pos;
+    r.vel = hit.vel;
+    r.dragged = max(r.dragged, hit.dragged);
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------- fur self-shadowing
+
+/** Nearest-cell density lookup in grid space; cells outside the box contribute nothing. */
+fn densityAt(gridPos: vec3f) -> f32 {
+  let c = vec3i(floor(mapToGrid(gridPos)));
+  if (!inGrid(c)) { return 0.0; }
+  return f32(densityI[voxelIndex(c.x, c.y, c.z)]) / DENSITY_SCALE;
+}
+
+/**
+ * Cheap deep-fur shadowing straight off the density grid the sim already builds:
+ * three taps marching towards the light, attenuated by Beer-Lambert. The occlusion is
+ * measured *relative to the density at the particle itself*, which makes the term
+ * self-calibrating — the beast (~140k particles in a 10^3 box) and the FurryBall
+ * (~1.3M in a 14^3 box) have wildly different absolute densities but the same ratio
+ * deep inside the coat. Result lands in the particle's prevPos.w for the renderer.
+ */
+fn selfShadow(pos: vec3f) -> f32 {
+  let gridPos = pos - u.modelTranslation.xyz;
+  let extent = u.maxBB.xyz - u.minBB.xyz;
+  let cell = min(extent.x, min(extent.y, extent.z)) / f32(GRID_SIZE);
+  let step = LIGHT_DIR * cell * 1.5;
+
+  var sum = 0.0;
+  for (var i = 1; i <= 3; i = i + 1) {
+    sum = sum + densityAt(gridPos + step * f32(i));
+  }
+  // 1.0 keeps sparse tip cells (density < 1 particle) from exploding the ratio
+  let local = max(densityAt(gridPos), 1.0);
+  // exp(-0.35 * 3) = 0.35: fully enclosed fur (all three taps as dense as here)
+  return clamp(exp(-0.35 * sum / local), 0.35, 1.0);
+}
+
 // ---------------------------------------------------------------- prologue / epilogue
 
 struct ThreadState {
@@ -122,15 +185,20 @@ fn loadState(gid: vec3u, lid: vec3u, wid: vec3u) -> ThreadState {
 
   // one writer per strand; the caller's barrier publishes it
   if (s.vertexIndexInStrand == 0u) {
-    sharedLen[s.localStrandIndex] = strandLengths[s.globalStrandIndex];
+    sharedLen[s.localStrandIndex] = roots[s.globalStrandIndex].w;
   }
   return s;
 }
 
 // updateParticle(): prevPos becomes the position this step started from, the colour
-// (and with it the fix flag in .w) is written back unchanged.
-fn writeBack(s: ThreadState, pos: vec3f) {
+// (and with it the fix flag in .w) is written back unchanged. prevPos.w carries the
+// self-shadow transmittance, which the renderer reads back per vertex.
+fn writeBackPrev(s: ThreadState, pos: vec3f, prevPos: vec3f) {
   particles[s.gi].pos = vec4f(pos, 1.0);
-  particles[s.gi].prevPos = vec4f(s.oldPosition.xyz, 1.0);
+  particles[s.gi].prevPos = vec4f(prevPos, selfShadow(pos));
   particles[s.gi].color = s.color;
+}
+
+fn writeBack(s: ThreadState, pos: vec3f) {
+  writeBackPrev(s, pos, s.oldPosition.xyz);
 }

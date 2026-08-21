@@ -3,9 +3,13 @@
 // vec2f align 8, f32-i32-u32 align 4, struct size rounded up to its alignment (16).
 // Every SIZE below is a multiple of 16.
 
-export const PARTICLE_STRIDE = 48; // pos vec4f @0, prevPos vec4f @16, color vec4f @32
+import { MAX_COLLIDERS } from '../params';
 
-// struct SimUniforms — 240 bytes
+export const PARTICLE_STRIDE = 48; // pos vec4f @0, prevPos vec4f @16 (w = self-shadow), color vec4f @32
+/** float32 offset of the self-shadow transmittance inside a Particle (prevPos.w) */
+export const PARTICLE_SHADE_OFFSET = 28;
+
+// struct SimUniforms — 240 bytes of scalars + three MAX_COLLIDERS vec4f arrays
 export const SIM_U = {
   modelMatrix: 0, // mat4x4f
   modelMatrixPrevInverted: 64, // mat4x4f
@@ -24,17 +28,25 @@ export const SIM_U = {
   numVerticesPerStrand: 224, // u32
   numStrandsPerThreadGroup: 228, // u32
   numStrands: 232, // u32
-  pad0: 236, // u32
-  SIZE: 240,
+  colliderCount: 236, // u32
+  colliderA: 240, // array<vec4f, MAX_COLLIDERS>   xyz = endpoint a, w = radius
+  colliderB: 240 + 16 * MAX_COLLIDERS, // array<vec4f>  xyz = endpoint b, w = 1 if it carries velocity
+  colliderVel: 240 + 32 * MAX_COLLIDERS, // array<vec4f> xyz = world velocity
+  SIZE: 240 + 48 * MAX_COLLIDERS,
 } as const;
 
-// struct RenderUniforms — 160 bytes
+// struct RenderUniforms — 192 bytes
 export const RENDER_U = {
   viewProj: 0, // mat4x4f
   model: 64, // mat4x4f
   overrideColor: 128, // vec4f
-  canvasHeight: 144, // f32
-  SIZE: 160,
+  cameraPos: 144, // vec4f
+  canvasWidth: 160, // f32
+  canvasHeight: 164, // f32
+  strandWidth: 168, // f32   ribbon width in device pixels
+  shading: 172, // f32   1 = Kajiya-Kay + self-shadow, 0 = flat
+  fade: 176, // f32   1 = apply the mirrored-floor distance fade
+  SIZE: 192,
 } as const;
 
 // struct BgUniforms — 48 bytes

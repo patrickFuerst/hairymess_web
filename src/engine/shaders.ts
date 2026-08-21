@@ -1,6 +1,7 @@
 // WGSL sources, string-composed with a generated constants prelude so the shader
 // constants can never drift from the engine config.
 
+import { MAX_COLLIDERS } from '../params';
 import type { EngineConfig } from './config';
 
 import commonSrc from '../shaders/common.wgsl?raw';
@@ -14,9 +15,10 @@ import simPBDSrc from '../shaders/simPBD.wgsl?raw';
 import backgroundSrc from '../shaders/background.wgsl?raw';
 import meshSrc from '../shaders/mesh.wgsl?raw';
 import hairSrc from '../shaders/hair.wgsl?raw';
-import floorFadeSrc from '../shaders/floorFade.wgsl?raw';
+import ribbonSrc from '../shaders/ribbon.wgsl?raw';
 import voxelDebugSrc from '../shaders/voxelDebug.wgsl?raw';
 import bboxSrc from '../shaders/bbox.wgsl?raw';
+import collidersSrc from '../shaders/colliders.wgsl?raw';
 
 export type ShaderName =
   | 'skinning'
@@ -28,9 +30,10 @@ export type ShaderName =
   | 'background'
   | 'mesh'
   | 'hair'
-  | 'floorFade'
+  | 'ribbon'
   | 'voxelDebug'
-  | 'bbox';
+  | 'bbox'
+  | 'colliders';
 
 export type ShaderSources = Record<ShaderName, string>;
 
@@ -47,6 +50,7 @@ const STRANDS_PER_GROUP: u32 = ${cfg.strandsPerGroup}u;
 const WORK_GROUP_SIZE: u32 = ${cfg.workGroupSize}u;
 const DENSITY_SCALE: f32 = ${f32Literal(cfg.densityScale)};
 const VELOCITY_SCALE: f32 = ${f32Literal(cfg.velocityScale)};
+const MAX_COLLIDERS: u32 = ${MAX_COLLIDERS}u;
 `;
 
   const prelude = `${constants}\n${commonSrc}\n`;
@@ -61,8 +65,9 @@ const VELOCITY_SCALE: f32 = ${f32Literal(cfg.velocityScale)};
     background: prelude + backgroundSrc,
     mesh: prelude + meshSrc,
     hair: prelude + hairSrc,
-    floorFade: prelude + floorFadeSrc,
+    ribbon: prelude + ribbonSrc,
     voxelDebug: prelude + voxelDebugSrc,
     bbox: prelude + bboxSrc,
+    colliders: prelude + collidersSrc,
   };
 }

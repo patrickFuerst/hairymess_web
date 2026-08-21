@@ -8,9 +8,21 @@ export type Algorithm = 'DFTL' | 'PBD';
  */
 export type ColorMode = 'alternating' | 'gradient';
 
+/**
+ * 'ribbons' — camera-facing quads with Kajiya-Kay strand shading (default).
+ * 'lines'   — the original 1px line-strip path (also the fallback when the device
+ *             cannot bind a storage buffer in the vertex stage).
+ */
+export type RenderMode = 'ribbons' | 'lines';
+
 export interface SimParams {
   algorithm: Algorithm;
   colorMode: ColorMode;
+  renderMode: RenderMode;
+  /** ribbon width in device pixels */
+  strandWidth: number;
+  /** Kajiya-Kay + self-shadow shading on the hair, form shading on the body */
+  shading: boolean;
   velocityDamping: number;
   numIterations: number;
   stiffness: number;
@@ -25,12 +37,16 @@ export interface SimParams {
   drawFur: boolean;
   drawVoxelGrid: boolean;
   drawBoundingBox: boolean;
+  drawColliders: boolean;
 }
 
 export function defaultParams(): SimParams {
   return {
     algorithm: 'DFTL',
     colorMode: 'alternating',
+    renderMode: 'ribbons',
+    strandWidth: 1.5,
+    shading: true,
     velocityDamping: 0.984694,
     numIterations: 30,
     stiffness: 1.0,
@@ -45,6 +61,7 @@ export function defaultParams(): SimParams {
     drawFur: true,
     drawVoxelGrid: false,
     drawBoundingBox: false,
+    drawColliders: false,
   };
 }
 
@@ -58,6 +75,13 @@ export const MAX_HAIR_LENGTH = 1.2;
 export const MAX_DT = 0.02;
 export const DENSITY_SCALE = 4096.0;
 export const VELOCITY_SCALE = 1024.0;
+
+/** Fixed simulation step. The frame's dt feeds an accumulator that drives whole steps. */
+export const SUBSTEP_DT = 1 / 120;
+/** Excess accumulation beyond this many steps is dropped (no spiral of death). */
+export const MAX_SUBSTEPS = 3;
+/** Hard cap on world-space capsule colliders uploaded per frame (SPEC v2). */
+export const MAX_COLLIDERS = 24;
 
 // Static simulation bounding box (voxel grid extent), like the original.
 export const BB_MIN: [number, number, number] = [-5, 0, -5];

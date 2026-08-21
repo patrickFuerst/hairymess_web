@@ -56,8 +56,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
 
   // "somehow PBD doesn't like collision detection before constraint" (original)
   var finalPos = sharedPos[s.localVertexIndex].xyz;
+  var prevOut = s.oldPosition.xyz;
   if (sharedFix[s.localVertexIndex] == 0u) {
-    finalPos = checkCollision(s.prevPosition.xyz, finalPos, velocity).pos;
+    let plane = checkCollision(s.prevPosition.xyz, finalPos, velocity);
+    finalPos = plane.pos;
+    let body = resolveColliders(finalPos, plane.vel);
+    finalPos = body.pos;
+    // PBD integrates before it collides, so the capsule response's velocity would be
+    // thrown away: it only survives through prevPos, which is what the next step
+    // differentiates. Untouched particles keep the original's prevPos = oldPosition.
+    if (body.dragged > 0.5) {
+      prevOut = finalPos - body.vel * u.deltaTime;
+    }
   }
-  writeBack(s, finalPos);
+  writeBackPrev(s, finalPos, prevOut);
 }

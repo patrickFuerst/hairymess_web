@@ -6,6 +6,25 @@ export interface GpuContext {
   context: GPUCanvasContext;
   format: GPUTextureFormat;
   hasTimestamps: boolean;
+  /** whether the ribbon path may bind the particle buffer as vertex-stage storage */
+  canPullInVertexStage: boolean;
+}
+
+/**
+ * WebGPU defaults `maxStorageBuffersInVertexStage` to 0, so vertex pulling has to be
+ * asked for. Older implementations predate the per-stage limit entirely and simply
+ * allow it under `maxStorageBuffersPerShaderStage`; a `requiredLimits` key an adapter
+ * does not know is a hard error, so it is only requested when the adapter reports it.
+ */
+function vertexStageStorageSupport(adapter: GPUAdapter): {
+  supported: boolean;
+  requiredLimits: Record<string, number>;
+} {
+  const limits = adapter.limits as unknown as Record<string, number | undefined>;
+  const reported = limits.maxStorageBuffersInVertexStage;
+  if (reported === undefined) return { supported: true, requiredLimits: {} };
+  if (reported < 1) return { supported: false, requiredLimits: {} };
+  return { supported: true, requiredLimits: { maxStorageBuffersInVertexStage: 1 } };
 }
 
 export class WebGpuUnavailableError extends Error {}
@@ -27,7 +46,23 @@ export async function initWebGPU(canvas: HTMLCanvasElement): Promise<GpuContext>
   const hasTimestamps = adapter.features.has('timestamp-query');
   const requiredFeatures: GPUFeatureName[] = hasTimestamps ? ['timestamp-query'] : [];
 
-  const device = await adapter.requestDevice({ requiredFeatures });
+  const vertexStorage = vertexStageStorageSupport(adapter);
+  let device: GPUDevice;
+  try {
+    device = await adapter.requestDevice({
+      requiredFeatures,
+      requiredLimits: vertexStorage.requiredLimits,
+    });
+  } catch (err) {
+    // an implementation that refuses the raised limit still gets the line hair path
+    console.warn('Falling back to default limits (no vertex-stage storage buffers).', err);
+    vertexStorage.supported = false;
+    device = await adapter.requestDevice({ requiredFeatures });
+  }
+  const deviceLimits = device.limits as unknown as Record<string, number | undefined>;
+  const grantedVertexStorage = deviceLimits.maxStorageBuffersInVertexStage;
+  const canPullInVertexStage =
+    vertexStorage.supported && (grantedVertexStorage === undefined || grantedVertexStorage >= 1);
 
   const context = canvas.getContext('webgpu');
   if (!context) {
@@ -37,7 +72,7 @@ export async function initWebGPU(canvas: HTMLCanvasElement): Promise<GpuContext>
   const format = navigator.gpu.getPreferredCanvasFormat();
   context.configure({ device, format, alphaMode: 'opaque' });
 
-  return { adapter, device, context, format, hasTimestamps };
+  return { adapter, device, context, format, hasTimestamps, canPullInVertexStage };
 }
 
 /**

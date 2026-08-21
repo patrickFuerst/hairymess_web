@@ -52,6 +52,23 @@ def apply_model_matrix(m_col_major: list[float], p: tuple[float, float, float]
     return (rx, ry, rz)
 
 
+# Same math as apply_model_matrix, under a name that also reads correctly when the matrix is
+# a per-joint skinning palette rather than modelMatrix (colliders section below: SPEC has the
+# runtime apply `palette[joint] x head` with weight 1, then modelMatrix -- both steps are this
+# same column-major-4x4-times-point operation).
+apply_mat4_point = apply_model_matrix
+
+
+def matrix_uniform_scale(m_col_major: list[float]) -> float:
+    """Length of the first basis column. bake_dae.py's modelMatrix is always
+    Translate(tx,ty,tz) @ Scale(s,s,s) @ AxisFix(identity) -- a uniform scale -- so any basis
+    column's length equals that scale factor s. Used only to print an eyeball-friendly
+    world-space radius alongside the collider placement table below; SPEC does not say the
+    runtime itself must scale the stored radius by this (unlike headA/headB, whose transform
+    is fully specified), so this is a diagnostic multiply, not a schema requirement."""
+    return math.sqrt(m_col_major[0] ** 2 + m_col_major[1] ** 2 + m_col_major[2] ** 2)
+
+
 def fail(msg: str) -> "NoReturn":
     print(f"VALIDATION FAILED: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -254,6 +271,89 @@ def main() -> None:
     print(f"  joint {mid_joint} palette max abs diff frame 0 vs frame 26: {max_diff:.5f}")
     if not (max_diff > 1e-6):
         fail(f"mid joint {mid_joint} palette does not differ between frame 0 and frame 26")
+
+    # ---- colliders extension (v2, optional) ----
+    colliders = meta.get("colliders")
+    if colliders is None:
+        print("\nNo 'colliders' section in the manifest -- OK, it's optional per SPEC "
+              "(engines fall back to floor-only collision).")
+    else:
+        print(f"\nValidating 'colliders' section ({len(colliders)} capsule(s))...")
+        if not (6 <= len(colliders) <= 24):
+            fail(f"collider count {len(colliders)} not in [6,24]")
+        for idx, cap in enumerate(colliders):
+            for key in ("jointA", "headA", "jointB", "headB", "radius"):
+                if key not in cap:
+                    fail(f"colliders[{idx}] missing key {key!r}")
+            if not (0 <= cap["jointA"] < J):
+                fail(f"colliders[{idx}].jointA {cap['jointA']} out of range [0,{J})")
+            if not (0 <= cap["jointB"] < J):
+                fail(f"colliders[{idx}].jointB {cap['jointB']} out of range [0,{J})")
+            if len(cap["headA"]) != 3:
+                fail(f"colliders[{idx}].headA has {len(cap['headA'])} components, expected 3")
+            if len(cap["headB"]) != 3:
+                fail(f"colliders[{idx}].headB has {len(cap['headB'])} components, expected 3")
+            for field in ("headA", "headB"):
+                if not all(math.isfinite(v) for v in cap[field]):
+                    fail(f"colliders[{idx}].{field} has a non-finite component: {cap[field]}")
+            if not math.isfinite(cap["radius"]):
+                fail(f"colliders[{idx}].radius is not finite: {cap['radius']}")
+            if not (cap["radius"] > 0.0):
+                fail(f"colliders[{idx}].radius must be positive, got {cap['radius']}")
+            # radius is specified as a plain scalar in the final "world-space collider
+            # array" (SPEC: Capsule.a.w), with no palette/modelMatrix multiply defined for
+            # it anywhere (unlike headA/headB) -- so unlike the endpoints, it must ALREADY
+            # be a sane world-space magnitude in the JSON itself. Bound it well above any
+            # plausible real radius (union Y extent is exactly 4.5 by construction) but well
+            # below "clearly the wrong units", to catch a raw/pre-bind_shape_matrix-space
+            # radius slipping through uncaught (that bug produced radii of ~6-44 here).
+            if not (cap["radius"] < 0.5 * (union_max_y - union_min_y)):
+                fail(f"colliders[{idx}].radius {cap['radius']:.4f} is implausibly large next "
+                     f"to the model's world height {union_max_y - union_min_y:.4f} -- looks "
+                     f"like it's still in raw/bind-shape space rather than world space")
+        print(f"  schema OK: count in [6,24], joint indices in range, headA/headB finite, "
+              f"radius finite/positive/plausible")
+
+        # CPU-skin each capsule endpoint with weight 1 to its own joint (SPEC: "Runtime skins
+        # each endpoint with weight 1 to its joint"), at frames 0 and 26 -- the same two
+        # frames already CPU-skinned above for the displacement check -- then apply
+        # modelMatrix, exactly like the runtime is specified to. Print a human-eyeballable
+        # table and assert every capsule's midpoint (frames 0 and 26) lands inside the union
+        # world bounds already computed above. Unlike headA/headB, "radius" carries no
+        # palette/modelMatrix transform of its own (see bake_dae.py's colliders_json comment)
+        # -- it's written to the manifest already in world units, so it's printed verbatim.
+        print(f"\n  modelMatrix uniform scale (informational only; NOT applied to radius, "
+              f"which is already world-space -- see bake_dae.py): {matrix_uniform_scale(model_matrix):.6f}")
+        print(f"  Per-capsule world-space placement:")
+        print(f"  {'idx':>3} {'jointA':>6} {'jointB':>6} {'frame':>5}  "
+              f"{'world A':^24}  {'world B':^24}  {'radius':>9}")
+        for idx, cap in enumerate(colliders):
+            jA, jB = cap["jointA"], cap["jointB"]
+            head_a = tuple(cap["headA"])
+            head_b = tuple(cap["headB"])
+            for f in (0, 26):
+                local_a = apply_mat4_point(palette_for(f, jA), head_a)
+                local_b = apply_mat4_point(palette_for(f, jB), head_b)
+                world_a = apply_model_matrix(model_matrix, local_a)
+                world_b = apply_model_matrix(model_matrix, local_b)
+                if not all(math.isfinite(v) for v in (*world_a, *world_b)):
+                    fail(f"colliders[{idx}] frame {f}: non-finite world endpoint "
+                         f"(A={world_a}, B={world_b})")
+                mid = tuple((world_a[k] + world_b[k]) / 2.0 for k in range(3))
+                eps = 1e-4
+                if not (union_min_x - eps <= mid[0] <= union_max_x + eps and
+                        union_min_y - eps <= mid[1] <= union_max_y + eps and
+                        union_min_z - eps <= mid[2] <= union_max_z + eps):
+                    fail(f"colliders[{idx}] frame {f}: midpoint {mid} outside union world "
+                         f"bounds X[{union_min_x:.3f},{union_max_x:.3f}] "
+                         f"Y[{union_min_y:.3f},{union_max_y:.3f}] "
+                         f"Z[{union_min_z:.3f},{union_max_z:.3f}]")
+                print(f"  {idx:3d} {jA:6d} {jB:6d} {f:5d}  "
+                      f"({world_a[0]:6.3f},{world_a[1]:6.3f},{world_a[2]:6.3f})  "
+                      f"({world_b[0]:6.3f},{world_b[1]:6.3f},{world_b[2]:6.3f})  "
+                      f"{cap['radius']:9.4f}")
+        print(f"\n  all {len(colliders)} capsules' midpoints (frames 0, 26) lie within the "
+              f"union world bounds: OK")
 
     # ---- file sizes ----
     bin_size = BIN_PATH.stat().st_size

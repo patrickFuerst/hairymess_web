@@ -1,12 +1,30 @@
 // GPU simulation: buffers, compute pipelines and every bind group (both ping-pong
 // parities) built up front. Nothing here allocates during the frame loop.
 
-import type { ColorMode, SimParams } from '../params';
+import { MAX_COLLIDERS, MAX_SUBSTEPS, SUBSTEP_DT, type ColorMode, type SimParams } from '../params';
 import { makeRng, type EngineConfig } from './config';
 import { createShaderModule } from './device';
 import { PARTICLE_STRIDE, SIM_U, SKIN_U, FILTER_U, UniformScratch, gpuWrite } from './layout';
-import { lerpPalette, skinWorld, type HairModel, type SkinnedSurface } from './model';
+import {
+  COLLIDER_FLOATS,
+  lerpPalette,
+  skinColliders,
+  skinWorld,
+  type HairModel,
+  type SkinnedSurface,
+} from './model';
 import { buildShaders } from './shaders';
+
+/** A pointer-driven brush capsule appended to the model's own colliders. */
+export interface BrushCollider {
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  vx: number;
+  vy: number;
+  vz: number;
+}
 
 /** parked position of the padding strands: far outside the voxel grid, never drawn */
 const PARKED = -10000;
@@ -67,7 +85,8 @@ export class HairSim {
   readonly particles: GPUBuffer;
   readonly hairIndexBuffer: GPUBuffer;
   readonly hairIndexCount: number;
-  readonly skinnedPositions: GPUBuffer;
+  /** two vec4f per vertex — position @0, skinned normal @16 (stride 32) */
+  readonly skinnedVerts: GPUBuffer;
   readonly meshIndexBuffer: GPUBuffer;
   readonly meshIndexCount: number;
   readonly simUniformBuffer: GPUBuffer;
@@ -79,9 +98,9 @@ export class HairSim {
   readonly strandLengthsCpu: Float32Array;
 
   private readonly velocityAtomic: GPUBuffer;
-  private readonly strandLengths: GPUBuffer;
   private readonly roots: GPUBuffer;
   private readonly bindPositions: GPUBuffer;
+  private readonly bindNormals: GPUBuffer;
   private readonly skinJoints: GPUBuffer;
   private readonly skinWeights: GPUBuffer;
   private readonly palette: GPUBuffer;
@@ -103,6 +122,9 @@ export class HairSim {
 
   private readonly simScratch = new UniformScratch(SIM_U.SIZE);
   private readonly paletteScratch: Float32Array;
+  private readonly colliderScratch = new Float32Array(MAX_COLLIDERS * COLLIDER_FLOATS);
+  /** world capsules as uploaded this frame — 8 floats each: a.xyz, radius, b.xyz, hasVelocity */
+  readonly colliderWorld = new Float32Array(MAX_COLLIDERS * 8);
   /** inverse of the previous frame's model matrix (parity with the original UBO) */
   private readonly modelMatrixInverse: Float32Array;
   private readonly prevModelMatrix: Float32Array;
@@ -111,6 +133,11 @@ export class HairSim {
   /** index of the grid buffer holding the current (readable) values */
   private ping = 0;
   private animationPhase = 0;
+  /** leftover frame time not yet consumed by a fixed sim step */
+  private accumulator = 0;
+  /** whole SUBSTEP_DT steps the next encode() will run */
+  private substeps = 0;
+  private colliderCount = 0;
 
   constructor(
     device: GPUDevice,
@@ -149,15 +176,9 @@ export class HairSim {
     });
     gpuWrite(device, this.particles, init.particles);
 
-    this.strandLengths = device.createBuffer({
-      label: 'strandLengths',
-      size: this.paddedStrands * 4,
-      usage: S | CD,
-    });
-    gpuWrite(device, this.strandLengths, init.strandLengths);
-
-    // roots are rewritten by the skinning pass every frame; only the padded tail,
-    // which the skinning dispatch does not cover, keeps this initial value.
+    // roots.xyz is rewritten by the skinning pass every frame (only the padded tail,
+    // which the dispatch does not cover, keeps its initial parked value); roots.w is
+    // the strand's rest length, written once here and preserved by the skinning pass.
     this.roots = device.createBuffer({
       label: 'roots',
       size: this.paddedStrands * 16,
@@ -180,6 +201,20 @@ export class HairSim {
     });
     gpuWrite(device, this.bindPositions, model.bindPositions);
 
+    // the bake ships vec3 normals; storage buffers want the vec4 stride
+    const bindNormals4 = new Float32Array(model.vertexCount * 4);
+    for (let i = 0; i < model.vertexCount; i++) {
+      bindNormals4[i * 4 + 0] = model.bindNormals[i * 3 + 0];
+      bindNormals4[i * 4 + 1] = model.bindNormals[i * 3 + 1];
+      bindNormals4[i * 4 + 2] = model.bindNormals[i * 3 + 2];
+    }
+    this.bindNormals = device.createBuffer({
+      label: 'bindNormals',
+      size: bindNormals4.byteLength,
+      usage: S | CD,
+    });
+    gpuWrite(device, this.bindNormals, bindNormals4);
+
     this.skinJoints = device.createBuffer({
       label: 'skinJoints',
       size: model.skinJoints.byteLength,
@@ -201,9 +236,9 @@ export class HairSim {
     });
     gpuWrite(device, this.palette, this.paletteScratch);
 
-    this.skinnedPositions = device.createBuffer({
-      label: 'skinnedPositions',
-      size: model.vertexCount * 16,
+    this.skinnedVerts = device.createBuffer({
+      label: 'skinnedVerts',
+      size: model.vertexCount * 32, // position vec4f + normal vec4f
       usage: S | GPUBufferUsage.VERTEX | CD,
     });
 
@@ -281,6 +316,7 @@ export class HairSim {
         readEntry(4),
         rwEntry(5),
         rwEntry(6),
+        readEntry(7),
       ],
     });
     this.skinPipeline = device.createComputePipeline({
@@ -298,7 +334,8 @@ export class HairSim {
         { binding: 3, resource: { buffer: this.skinWeights } },
         { binding: 4, resource: { buffer: this.palette } },
         { binding: 5, resource: { buffer: this.roots } },
-        { binding: 6, resource: { buffer: this.skinnedPositions } },
+        { binding: 6, resource: { buffer: this.skinnedVerts } },
+        { binding: 7, resource: { buffer: this.bindNormals } },
       ],
     });
 
@@ -382,6 +419,8 @@ export class HairSim {
     );
 
     // --- simulation (two algorithms x two parities)
+    // 1 uniform + 5 storage: particles, roots (w = rest length, which used to be its
+    // own binding), the two grid parities and the density grid for the self-shadow taps.
     const simLayout = device.createBindGroupLayout({
       label: 'simLayout',
       entries: [uniformEntry(0), rwEntry(1), readEntry(2), readEntry(3), readEntry(4), readEntry(5)],
@@ -406,10 +445,10 @@ export class HairSim {
         entries: [
           { binding: 0, resource: { buffer: this.simUniformBuffer } },
           { binding: 1, resource: { buffer: this.particles } },
-          { binding: 2, resource: { buffer: this.strandLengths } },
-          { binding: 3, resource: { buffer: this.roots } },
-          { binding: 4, resource: { buffer: this.velocityGrid[ping] } },
-          { binding: 5, resource: { buffer: this.gradientGrid[ping] } },
+          { binding: 2, resource: { buffer: this.roots } },
+          { binding: 3, resource: { buffer: this.velocityGrid[ping] } },
+          { binding: 4, resource: { buffer: this.gradientGrid[ping] } },
+          { binding: 5, resource: { buffer: this.densityAtomic } },
         ],
       })
     );
@@ -447,20 +486,52 @@ export class HairSim {
     const surface = skinWorld(this.model, this.paletteScratch);
     const init = buildInitialState(this.model, surface, this.cfg, this.paddedStrands, colorMode);
     gpuWrite(this.device, this.particles, init.particles);
-    gpuWrite(this.device, this.strandLengths, init.strandLengths);
+    // rewrite the rest lengths in roots.w; the skinning pass restores .xyz next frame
+    gpuWrite(this.device, this.roots, init.roots);
+  }
+
+  /** whole fixed steps the next `encode()` will run (0 on a very short frame) */
+  get substepCount(): number {
+    return this.substeps;
+  }
+
+  /** capsules uploaded this frame, including the pointer brush */
+  get activeColliders(): number {
+    return this.colliderCount;
   }
 
   get currentColorMode(): ColorMode {
     return this.colorMode;
   }
 
-  /** Advances the animation clock and uploads the per-frame uniforms + joint palette. */
-  update(params: SimParams, dt: number): void {
+  /**
+   * Advances the animation clock, works out how many fixed sim steps this frame owes,
+   * and uploads the per-frame uniforms, joint palette and world-space colliders.
+   *
+   * The animation, the skinning pass and the collider positions all run once per
+   * frame at the frame's own `dt`; only the solver is substepped. Holding the
+   * colliders still across a frame's 1-3 steps costs at most 25 ms of collider lag at
+   * 40 fps, which is far cheaper than re-skinning and re-uploading them per step.
+   */
+  update(params: SimParams, dt: number, brush: BrushCollider | null = null): void {
     const model = this.model;
     if (params.playAnimation) {
       this.animationPhase = (this.animationPhase + dt) % model.duration;
       if (this.animationPhase < 0) this.animationPhase += model.duration;
     }
+
+    // fixed-timestep accumulator; excess beyond MAX_SUBSTEPS is dropped outright so a
+    // long frame (tab switch, GC pause) can never spiral into ever more work
+    this.accumulator += dt;
+    const wanted = Math.floor(this.accumulator / SUBSTEP_DT + 1e-6);
+    if (wanted > MAX_SUBSTEPS) {
+      this.substeps = MAX_SUBSTEPS;
+      this.accumulator = 0;
+    } else {
+      this.substeps = wanted;
+      this.accumulator -= wanted * SUBSTEP_DT;
+    }
+
     lerpPalette(model, this.animationPhase, this.paletteScratch);
     gpuWrite(this.device, this.palette, this.paletteScratch);
 
@@ -484,13 +555,48 @@ export class HairSim {
     s.setF32(SIM_U.friction, params.friction);
     s.setF32(SIM_U.repulsion, params.repulsion);
     s.setF32(SIM_U.ftlDamping, params.ftlDamping);
-    s.setF32(SIM_U.deltaTime, Math.max(dt, 1e-5));
+    // fixed step, so the voxel fill's (pos - prevPos)/dt matches what the solver used
+    s.setF32(SIM_U.deltaTime, SUBSTEP_DT);
     s.setI32(SIM_U.gridSize, cfg.gridSize);
     s.setU32(SIM_U.numVerticesPerStrand, cfg.particlesPerStrand);
     s.setU32(SIM_U.numStrandsPerThreadGroup, cfg.strandsPerGroup);
     s.setU32(SIM_U.numStrands, this.numStrands);
-    s.setU32(SIM_U.pad0, 0);
+    this.writeColliders(s, brush);
     gpuWrite(this.device, this.simUniformBuffer, s.bytes);
+  }
+
+  /** Skins the model's capsules into world space and appends the pointer brush. */
+  private writeColliders(s: UniformScratch, brush: BrushCollider | null): void {
+    const skinned = skinColliders(this.model, this.paletteScratch, this.colliderScratch);
+    const world = this.colliderWorld;
+    let count = 0;
+
+    const emit = (
+      ax: number, ay: number, az: number, radius: number,
+      bx: number, by: number, bz: number, hasVelocity: number,
+      vx: number, vy: number, vz: number
+    ): void => {
+      s.setVec4(SIM_U.colliderA + count * 16, ax, ay, az, radius);
+      s.setVec4(SIM_U.colliderB + count * 16, bx, by, bz, hasVelocity);
+      s.setVec4(SIM_U.colliderVel + count * 16, vx, vy, vz, 0);
+      const w = count * 8;
+      world[w] = ax; world[w + 1] = ay; world[w + 2] = az; world[w + 3] = radius;
+      world[w + 4] = bx; world[w + 5] = by; world[w + 6] = bz; world[w + 7] = hasVelocity;
+      count++;
+    };
+
+    for (let i = 0; i < skinned && count < MAX_COLLIDERS; i++) {
+      const o = i * COLLIDER_FLOATS;
+      const c = this.colliderScratch;
+      emit(c[o], c[o + 1], c[o + 2], c[o + 6], c[o + 3], c[o + 4], c[o + 5], 0, 0, 0, 0);
+    }
+    if (brush && count < MAX_COLLIDERS) {
+      // degenerate capsule (a == b) whose w = 1 tells the kernels to drag the fur along
+      emit(brush.x, brush.y, brush.z, brush.radius, brush.x, brush.y, brush.z, 1,
+        brush.vx, brush.vy, brush.vz);
+    }
+    s.setU32(SIM_U.colliderCount, count);
+    this.colliderCount = count;
   }
 
   /** One clear + one compute pass with every dispatch of the frame graph. */
@@ -532,10 +638,14 @@ export class HairSim {
       }
     }
 
-    // 5. hair solver
+    // 5. hair solver — the grid above is built once per frame, the solver runs once
+    //    per fixed SUBSTEP_DT step (0-3 of them). Consecutive dispatches of the same
+    //    pipeline in one pass are ordered and barriered by WebGPU.
     pass.setPipeline(this.simPipelines[params.algorithm]);
     pass.setBindGroup(0, this.simBindGroups[params.algorithm][this.ping]);
-    pass.dispatchWorkgroups(particleGroups);
+    for (let step = 0; step < this.substeps; step++) {
+      pass.dispatchWorkgroups(particleGroups);
+    }
 
     pass.end();
   }
@@ -545,8 +655,8 @@ export class HairSim {
 
 interface InitialState {
   particles: Float32Array;
-  strandLengths: Float32Array;
   strandLengthsReal: Float32Array;
+  /** vec4 per strand: xyz overwritten by skinning every frame, w = rest length */
   roots: Float32Array;
   hairIndices: Uint32Array;
 }
@@ -568,7 +678,6 @@ function buildInitialState(
   const paddedParticles = paddedStrands * perStrand;
 
   const particles = new Float32Array(paddedParticles * (PARTICLE_STRIDE / 4));
-  const strandLengths = new Float32Array(paddedStrands);
   const strandLengthsReal = new Float32Array(numStrands);
   const roots = new Float32Array(paddedStrands * 4);
   const hairIndices = new Uint32Array(numStrands * (perStrand + 1));
@@ -605,7 +714,7 @@ function buildInitialState(
       particles[p + 4] = x; // prevPos = pos
       particles[p + 5] = y;
       particles[p + 6] = z;
-      particles[p + 7] = 1;
+      particles[p + 7] = 1; // prevPos.w = self-shadow transmittance, 1 = unshadowed
       if (useGradient) {
         gradientColor(j / lastIndex, gradient);
         particles[p + 8] = gradient[0];
@@ -621,13 +730,11 @@ function buildInitialState(
     }
     hairIndices[ii++] = RESTART_INDEX;
 
-    strandLengths[i] = hairLength;
     strandLengthsReal[i] = hairLength;
   }
 
   // padding strands: every particle fixed and parked outside the grid
   for (let i = numStrands; i < paddedStrands; i++) {
-    strandLengths[i] = cfg.minHairLength;
     for (let j = 0; j < perStrand; j++) {
       const p = (i * perStrand + j) * 12;
       particles[p + 0] = PARKED;
@@ -642,18 +749,20 @@ function buildInitialState(
     }
   }
 
-  // roots: real entries are overwritten by the skinning pass every frame, the padded
-  // tail (which the dispatch does not cover) keeps the parked position forever.
+  // roots: xyz of the real entries is overwritten by the skinning pass every frame,
+  // the padded tail (which the dispatch does not cover) keeps the parked position
+  // forever. w carries the strand's rest length — the skinning pass preserves it,
+  // which is what lets the solver drop its separate strandLengths binding.
   for (let i = 0; i < paddedStrands; i++) {
     const o = i * 4;
     const real = i < numStrands;
     roots[o + 0] = real ? 0 : PARKED;
     roots[o + 1] = real ? 0 : PARKED;
     roots[o + 2] = real ? 0 : PARKED;
-    roots[o + 3] = 1;
+    roots[o + 3] = real ? strandLengthsReal[i] : cfg.minHairLength;
   }
 
-  return { particles, strandLengths, strandLengthsReal, roots, hairIndices };
+  return { particles, strandLengthsReal, roots, hairIndices };
 }
 
 // ---------------------------------------------------------------- mat4 inverse (column-major)

@@ -753,6 +753,415 @@ def world_bounds_full(bounds: Bounds, scale: float, tx: float, ty: float, tz: fl
 
 
 # =========================================================================================
+# Collider capsules (v2 SPEC extension): auto-fit capsules to the skinned character from the
+# joint hierarchy + per-vertex dominant skin weight, written as beast.json's optional
+# "colliders" array (SPEC.md, "Colliders extension (v2)").
+#
+# SPACE: endpoints are stored in the same raw/model space as the "positions" buffer (i.e.
+# BEFORE bind_shape_matrix), because the runtime applies `palette[joint] x head` directly to
+# them, and palette already has bind_shape_matrix baked in on its right-hand side (see
+# compute_palettes() above: palette = world(t) @ inverseBind @ bindShape) -- so a stored
+# endpoint must be "pre-bind-shape" for that one runtime multiply to land it in the right
+# place, exactly like the vertex "positions" buffer already is. Concretely: for joint j, its
+# bind-pose WORLD position (in the "post bind-shape" space the inverse-bind matrices operate
+# in) is the translation column of inverse(inverse_bind[j]) -- call it bindWorld(j); by
+# definition of "inverse bind matrix", bindWorld(j) @ inverse_bind[j] == I (the algebraic form
+# of the empirical fact already relied on above main(), "worldTransform(joint, bind pose) x
+# inverseBind(joint) is the identity matrix"). Un-doing bind_shape_matrix on that point
+# (multiplying by its inverse) gives a point p such that palette[j](t) @ p == worldTransform(
+# j, t) for EVERY frame t, not just bind pose -- i.e. it tracks the joint's own origin exactly,
+# with zero residual local offset, which is exactly what a capsule endpoint pinned to a joint
+# needs. compute_joint_bind_heads() below re-verifies the identity per joint at bake time
+# rather than assuming it, since a silent inversion bug here would place every collider in the
+# wrong spot without any other symptom.
+# =========================================================================================
+
+def mat4_inverse(m: list[float]) -> list[float]:
+    """General 4x4 inverse via Gauss-Jordan elimination with partial pivoting (row-major flat
+    16-list in, same convention out). Only ever called on a few dozen small matrices (per-
+    joint inverse-bind matrices, bind_shape_matrix) once at bake time -- no performance need
+    for a closed-form cofactor expansion."""
+    a = [row[:] for row in (m[0:4], m[4:8], m[8:12], m[12:16])]
+    for i in range(4):
+        a[i] = a[i] + [1.0 if k == i else 0.0 for k in range(4)]
+    for col in range(4):
+        pivot = max(range(col, 4), key=lambda r: abs(a[r][col]))
+        if abs(a[pivot][col]) < 1e-12:
+            raise ValueError(f"mat4_inverse: singular matrix (column {col}): {m}")
+        a[col], a[pivot] = a[pivot], a[col]
+        pv = a[col][col]
+        a[col] = [x / pv for x in a[col]]
+        for r in range(4):
+            if r != col:
+                factor = a[r][col]
+                if factor != 0.0:
+                    a[r] = [a[r][k] - factor * a[col][k] for k in range(8)]
+    out: list[float] = []
+    for r in range(4):
+        out.extend(a[r][4:8])
+    return out
+
+
+def mat4_uniform_scale(m: list[float]) -> float:
+    """Length of the transformed X basis vector -- a generic way to read a (row-major)
+    matrix's uniform scale factor without assuming it's a perfectly diagonal matrix.
+    (Empirically this file's bind_shape_matrix IS exactly diag(0.01,0.01,0.01,1), verified by
+    inspection, but this stays correct even if a future re-export's bind_shape_matrix carries
+    a bit of rotation alongside the scale.)"""
+    return math.sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8])
+
+
+def build_joint_tree(
+    armature_node: ET.Element, joint_index_by_name: dict[str, int]
+) -> tuple[list[int | None], list[list[int]]]:
+    """Walk the same scene-graph hierarchy compute_world_transforms_for_frame() walks, but
+    just to record structure: for every joint, its parent JOINT index (the nearest ancestor
+    node that is itself a joint -- there happen to be none in this file, every node under
+    Armature is a joint, but the walk doesn't assume that) and its list of child joint
+    indices. Root joint(s) (no joint ancestor) get parent=None."""
+    joint_count = len(joint_index_by_name)
+    parent: list[int | None] = [None] * joint_count
+    children: list[list[int]] = [[] for _ in range(joint_count)]
+
+    def recurse(node: ET.Element, ancestor_joint: int | None) -> None:
+        key = node_key(node)
+        j = joint_index_by_name.get(key) if key else None
+        if j is not None:
+            parent[j] = ancestor_joint
+            if ancestor_joint is not None:
+                children[ancestor_joint].append(j)
+            ancestor_joint = j
+        for child in node.findall("node"):
+            recurse(child, ancestor_joint)
+
+    recurse(armature_node, None)
+    return parent, children
+
+
+def compute_joint_bind_heads(
+    joint_names: list[str],
+    inverse_bind: list[list[float]],
+    bind_shape_matrix: list[float],
+) -> list[tuple[float, float, float]]:
+    """Per joint, its bind-pose head position in the SAME raw/model space as the stored
+    'positions' buffer (see the section banner above for why). Also re-verifies, per joint,
+    that inverting inverse_bind really does cancel it back to the identity -- a silent
+    inversion bug would otherwise place colliders in the wrong spot with no other symptom."""
+    bind_shape_inv = mat4_inverse(bind_shape_matrix)
+    heads: list[tuple[float, float, float]] = []
+    worst_identity_err = 0.0
+    for j in range(len(joint_names)):
+        bind_world = mat4_inverse(inverse_bind[j])
+        check = mat4_mul(bind_world, inverse_bind[j])
+        err = max(abs(check[k] - (1.0 if k in (0, 5, 10, 15) else 0.0)) for k in range(16))
+        worst_identity_err = max(worst_identity_err, err)
+        trans_skinbind = (bind_world[3], bind_world[7], bind_world[11])
+        heads.append(mat4_apply_point(bind_shape_inv, trans_skinbind))
+    if worst_identity_err > 1e-4:
+        raise ValueError(
+            f"compute_joint_bind_heads: bindWorld(j) @ inverse_bind[j] deviates from identity "
+            f"by {worst_identity_err:.6g} for some joint -- inversion or bind data looks "
+            f"wrong, refusing to place colliders from it")
+    return heads
+
+
+def percentile(sorted_values: list[float], pct: float) -> float:
+    """Linear-interpolation percentile (numpy's default 'linear' method) on an already-sorted
+    list. pct in [0,100]."""
+    n = len(sorted_values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return sorted_values[0]
+    k = (n - 1) * (pct / 100.0)
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return sorted_values[int(k)]
+    return sorted_values[int(lo)] * (hi - k) + sorted_values[int(hi)] * (k - lo)
+
+
+def point_line_distance(
+    p: tuple[float, float, float],
+    origin: tuple[float, float, float],
+    direction_unit: tuple[float, float, float],
+) -> tuple[float, float]:
+    """Perpendicular distance from point p to the INFINITE line through origin along
+    direction_unit (must already be normalized), plus the signed parameter t such that the
+    closest point on the line is origin + t*direction_unit. Deliberately not clamped to a
+    segment: the radius fit samples the whole infinite axis per the task's own algorithm
+    (vertices near either end of a bone still push its radius, which is what a capsule that
+    must fully contain them needs); t is only used by the leaf-offset-capsule path to size the
+    capsule's length along its own offset direction."""
+    dx = p[0] - origin[0]
+    dy = p[1] - origin[1]
+    dz = p[2] - origin[2]
+    t = dx * direction_unit[0] + dy * direction_unit[1] + dz * direction_unit[2]
+    cx = origin[0] + t * direction_unit[0]
+    cy = origin[1] + t * direction_unit[1]
+    cz = origin[2] + t * direction_unit[2]
+    ddx, ddy, ddz = p[0] - cx, p[1] - cy, p[2] - cz
+    return math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz), t
+
+
+FINGER_NAME_MARKERS = ("Thumb", "Index", "Middle", "Ring", "Pinky")
+
+
+def is_finger_joint(name: str) -> bool:
+    """Name-pattern check for this rig's Mixamo-style finger joints (e.g.
+    'BeastBaseMesh_LeftHandRing3'). Structural detection (e.g. 'N+ joints deep below a Hand
+    joint') would be more rig-agnostic, but this rig's naming is entirely regular and this is
+    far simpler; see fit_colliders()'s docstring for why finger chains are dropped outright
+    rather than collapsed into a per-hand capsule."""
+    return any(marker in name for marker in FINGER_NAME_MARKERS)
+
+
+# Radius-fit constants (SPEC.md "Colliders extension (v2)"; the task's suggested starting
+# point -- see fit_colliders()'s docstring for the one deliberate structural deviation, and
+# COLLIDER_MERGE_CHAINS below for why the radius clamp itself is kept as literally suggested
+# rather than loosened).
+COLLIDER_RADIUS_PERCENTILE = 75.0
+COLLIDER_RADIUS_SCALE = 0.9          # "slightly tight is better than slightly fat"
+COLLIDER_RADIUS_MIN_FRAC = 0.02      # of bone length
+COLLIDER_RADIUS_MAX_FRAC = 0.5       # of bone length
+COLLIDER_MIN_DOMINANT_VERTS = 30
+COLLIDER_MIN_BONE_LEN_FRAC_OF_HEIGHT = 0.02
+COLLIDER_MODEL_WORLD_HEIGHT = 4.5    # by construction of compute_scale_translate()
+COLLIDER_MAX_CAPSULES = 24           # SPEC hard cap
+
+# Joint chains to fuse into a single capsule instead of one capsule per parent/child edge.
+# Each entry is a run of joint names from proximal to distal; the emitted capsule spans
+# chain[0]'s head to chain[-1]'s head, fit against the UNION of every listed joint's dominant
+# vertices. Currently just the spine, and it's a fit-QUALITY fix, not merely a capsule-count
+# trim: SPEC's own task description names this one region ("hips-spine-chest"), and fitting
+# the 3 individual sub-segments separately turned out to be a real bug when tuning this --
+# each segment is short (~0.29-0.38 world units) relative to this creature's torso girth (a
+# stocky "Beast", not a slim human: p75 cross-section distance came out ~0.42-0.47 world
+# units per segment, checked numerically), so the suggested 0.5x-bone-length radius clamp cut
+# every one of the 3 segments down to 34-46% of its properly-fit radius -- visibly too thin to
+# stop hair at the actual torso surface. Chaining the 3 segments into one ~1.0-unit-long bone
+# gives that SAME clamp rule enough bone length to accommodate the natural fit with NO
+# clamping at all. Left as an explicit list (rather than e.g. "always merge single-child
+# chains") so other single-child runs -- neck->head, for instance -- are NOT merged: merging
+# those would inflate the neck's radius to match the head's, which is the opposite failure
+# (too fat) rather than the spine's under-fit bug, so Neck->Head and Head->HeadTop_End keep
+# their own separately-tapered radii instead.
+COLLIDER_MERGE_CHAINS: list[list[str]] = [
+    [
+        "BeastBaseMesh_Hips",
+        "BeastBaseMesh_Spine",
+        "BeastBaseMesh_Spine1",
+        "BeastBaseMesh_Spine2",
+    ],
+]
+
+
+def _fit_capsule_radius(
+    positions: list[float],
+    vertex_ids,
+    origin: tuple[float, float, float],
+    direction_unit: tuple[float, float, float],
+    bone_len: float,
+) -> tuple[float, float]:
+    """Shared radius-fit core for both bone-segment and leaf-offset capsules: robust
+    percentile of perpendicular distance to the axis, tightened by COLLIDER_RADIUS_SCALE,
+    clamped to [COLLIDER_RADIUS_MIN_FRAC, COLLIDER_RADIUS_MAX_FRAC] x bone_len. Returns
+    (clamped_radius, unclamped_radius) so callers can report when/how much clamping bit."""
+    dists = sorted(
+        point_line_distance(
+            (positions[vi * 3], positions[vi * 3 + 1], positions[vi * 3 + 2]),
+            origin, direction_unit,
+        )[0]
+        for vi in vertex_ids
+    )
+    raw_radius = percentile(dists, COLLIDER_RADIUS_PERCENTILE) * COLLIDER_RADIUS_SCALE
+    clamped = max(COLLIDER_RADIUS_MIN_FRAC * bone_len,
+                  min(COLLIDER_RADIUS_MAX_FRAC * bone_len, raw_radius))
+    return clamped, raw_radius
+
+
+def fit_colliders(
+    joint_names: list[str],
+    joint_parent: list[int | None],
+    joint_children: list[list[int]],
+    joint_head: list[tuple[float, float, float]],
+    positions: list[float],
+    dominant_by_joint: dict[int, list[int]],
+    raw_to_world_scale: float,
+) -> tuple[list[dict], list[tuple[str, str | None, str]]]:
+    """Auto-fit collision capsules per SPEC.md 'Colliders extension (v2)'. Returns (capsules,
+    dropped): capsules carry jointA/headA/jointB/headB/radius (ready to serialize verbatim,
+    endpoints in the same raw/model space as the 'positions' buffer) plus '_debug_*' fields
+    for the bake-time summary (stripped before writing JSON); dropped is a list of (nameA,
+    nameB_or_None, reason) for that same summary.
+
+    Deliberate deviations from the task's literal suggested algorithm, and why:
+      1. Finger joints (name-pattern matched, see is_finger_joint()) are excluded from
+         candidate generation entirely -- dropped, not collapsed into a per-hand capsule.
+         The task's own target coverage list ("hips-spine-chest, neck-head, both upper arms,
+         forearms, thighs, shins, and feet") does not mention hands, and this rig has 40
+         finger joints (5 fingers x 4 phalanges x 2 hands) whose per-edge candidates ALL
+         numerically clear the length/vertex-count thresholds on their own (verified while
+         tuning this -- e.g. LeftHand->LeftHandIndex1 alone is 6.4% of model height with 301
+         dominant vertices), which would blow well past the 24-capsule cap by itself if kept.
+         LeftForeArm->LeftHand's capsule already reaches the wrist, and its radius fit folds
+         in LeftHand's own dominant (palm) vertices too (see the "OR c" rule below), so the
+         palm gets incidental coverage without a dedicated capsule.
+      2. The Hips/Spine/Spine1/Spine2 chain is fused into one capsule -- see
+         COLLIDER_MERGE_CHAINS' comment for the numeric justification (a fit-quality fix, not
+         just a capsule-count trim).
+      3. Toe joints are NOT excluded (unlike fingers): this rig has exactly one toe bone per
+         foot (ToeBase->Toe_End), not a 5-way-branching multi-joint chain, so there's no
+         combinatorial blowup, and both toe-related edges clear the thresholds with a healthy
+         margin on real mesh coverage (LeftFoot->LeftToeBase: 755 dominant vertices, 12% of
+         height) -- so they're kept as ordinary candidates, matching the task's "feet if they
+         carry enough vertices".
+
+    Per-candidate vertex collection uses "dominant(j) UNION dominant(c)" (the task's "belongs
+    to j (or to c for leaf coverage)") unconditionally, not only when c is a true leaf: since
+    top-1 dominant weight partitions every vertex to exactly one joint, this is simply "every
+    vertex whose skin weight is dominated by either endpoint of this bone", which is the most
+    direct reading of "or c for leaf coverage" and also folds in cap-end flesh (e.g. the
+    shoulder cap, the wrist/palm boundary) that would otherwise inform no capsule at all.
+    """
+    joint_count = len(joint_names)
+    capsules: list[dict] = []
+    dropped: list[tuple[str, str | None, str]] = []
+    min_bone_len_world = COLLIDER_MIN_BONE_LEN_FRAC_OF_HEIGHT * COLLIDER_MODEL_WORLD_HEIGHT
+    name_to_index = {name: i for i, name in enumerate(joint_names)}
+    merged_interior: set[tuple[int, int]] = set()  # (parent,child) edges absorbed by a merge
+
+    def add_bone_candidate(a_idx: int, b_idx: int, member_idxs: list[int], label: str) -> None:
+        name_a, name_b = joint_names[a_idx], joint_names[b_idx]
+        head_a, head_b = joint_head[a_idx], joint_head[b_idx]
+        bone_vec = tuple(head_b[k] - head_a[k] for k in range(3))
+        bone_len = math.sqrt(sum(x * x for x in bone_vec))
+        bone_len_world = bone_len * raw_to_world_scale
+        if bone_len < 1e-9:
+            dropped.append((name_a, name_b, "degenerate bone (length ~0)"))
+            return
+        if bone_len_world < min_bone_len_world:
+            dropped.append((name_a, name_b,
+                             f"bone length {bone_len_world:.4f} world < "
+                             f"{min_bone_len_world:.4f} (2% of height {COLLIDER_MODEL_WORLD_HEIGHT})"))
+            return
+        vertex_ids: set[int] = set()
+        for m in member_idxs:
+            vertex_ids.update(dominant_by_joint.get(m, ()))
+        if len(vertex_ids) < COLLIDER_MIN_DOMINANT_VERTS:
+            dropped.append((name_a, name_b,
+                             f"only {len(vertex_ids)} dominant vertices < {COLLIDER_MIN_DOMINANT_VERTS}"))
+            return
+        direction = tuple(x / bone_len for x in bone_vec)
+        radius, raw_radius = _fit_capsule_radius(positions, vertex_ids, head_a, direction, bone_len)
+        clamp_note = "" if abs(radius - raw_radius) < 1e-9 else \
+            f" (clamped from {raw_radius * raw_to_world_scale:.4f})"
+        capsules.append({
+            "jointA": a_idx, "headA": list(head_a), "jointB": b_idx, "headB": list(head_b),
+            "radius": radius,
+            "_debug_label": label, "_debug_vertcount": len(vertex_ids),
+            "_debug_bone_len_world": bone_len_world, "_debug_radius_world": radius * raw_to_world_scale,
+            "_debug_clamp_note": clamp_note,
+        })
+
+    # --- Merged chains first, so the ordinary per-edge loop below can skip their interior
+    # edges (added to merged_interior here). ---
+    for chain in COLLIDER_MERGE_CHAINS:
+        idxs = [name_to_index[n] for n in chain]
+        for a, b in zip(idxs, idxs[1:]):
+            merged_interior.add((a, b))
+        add_bone_candidate(idxs[0], idxs[-1], idxs,
+                            f"{chain[0]} .. {chain[-1]} (merged {len(chain)}-joint chain)")
+
+    # --- Ordinary parent -> child edges. ---
+    for c in range(joint_count):
+        p = joint_parent[c]
+        if p is None:
+            continue
+        name_p, name_c = joint_names[p], joint_names[c]
+        if is_finger_joint(name_p) or is_finger_joint(name_c):
+            dropped.append((name_p, name_c, "finger chain (excluded by name pattern)"))
+            continue
+        if (p, c) in merged_interior:
+            dropped.append((name_p, name_c, "absorbed into a merged chain"))
+            continue
+        add_bone_candidate(p, c, [p, c], f"{name_p} -> {name_c}")
+
+    # --- Leaf joints (no children): cover them with an offset capsule/sphere grown from their
+    # own dominant vertices, per the task's step 4. In THIS rig every true leaf (HeadTop_End,
+    # every *4 fingertip, both Toe_End joints) has ZERO dominant vertices -- Mixamo-style
+    # "_End" joints are orientation markers with no skin weight of their own; the mesh right
+    # up to the tip is dominantly weighted to their PARENT instead, already folded into that
+    # parent edge's fit above via the "dominant(j) union dominant(c)" rule. So this loop is
+    # expected to find nothing to add for this specific rig, and every leaf will show up in
+    # `dropped` with vertcount 0 -- implemented in full anyway (not just asserted away) so a
+    # future re-export with actual tip weighting is handled correctly with no changes here.
+    for j in range(joint_count):
+        if joint_children[j] or joint_parent[j] is None:
+            continue
+        name = joint_names[j]
+        if is_finger_joint(name):
+            dropped.append((name, None, "finger chain (excluded by name pattern)"))
+            continue
+        vertex_ids = list(dominant_by_joint.get(j, ()))
+        if len(vertex_ids) < COLLIDER_MIN_DOMINANT_VERTS:
+            dropped.append((name, None, f"leaf: only {len(vertex_ids)} dominant vertices < "
+                                         f"{COLLIDER_MIN_DOMINANT_VERTS}"))
+            continue
+        head = joint_head[j]
+        pts = [(positions[vi * 3], positions[vi * 3 + 1], positions[vi * 3 + 2]) for vi in vertex_ids]
+        centroid = tuple(sum(p[k] for p in pts) / len(pts) for k in range(3))
+        offset = tuple(centroid[k] - head[k] for k in range(3))
+        offset_len = math.sqrt(sum(x * x for x in offset))
+        radial = [math.sqrt(sum((p[k] - head[k]) ** 2 for k in range(3))) for p in pts]
+        spread = sum(radial) / len(radial)
+        if spread < 1e-9:
+            dropped.append((name, None, "leaf: degenerate zero spread"))
+            continue
+        if offset_len < 0.3 * spread:
+            # Vertices roughly symmetric around the joint -- no clear "outward" direction,
+            # fall back to a bounding sphere (a==b, per SPEC's "sphere is a degenerate
+            # capsule" note).
+            r = max(0.3 * spread, min(1.0 * spread,
+                    percentile(sorted(radial), COLLIDER_RADIUS_PERCENTILE) * COLLIDER_RADIUS_SCALE))
+            capsules.append({
+                "jointA": j, "headA": list(head), "jointB": j, "headB": list(head), "radius": r,
+                "_debug_label": f"{name} (leaf sphere)", "_debug_vertcount": len(vertex_ids),
+                "_debug_bone_len_world": 0.0, "_debug_radius_world": r * raw_to_world_scale,
+                "_debug_clamp_note": "",
+            })
+        else:
+            direction = tuple(x / offset_len for x in offset)
+            ts = [point_line_distance(p, head, direction)[1] for p in pts]
+            forward_ts = sorted(t for t in ts if t > 0.0) or [offset_len]
+            length = max(0.3 * offset_len, min(2.0 * offset_len, percentile(forward_ts, 90.0)))
+            tail = tuple(head[k] + direction[k] * length for k in range(3))
+            radius, raw_radius = _fit_capsule_radius(positions, set(vertex_ids), head, direction, length)
+            capsules.append({
+                "jointA": j, "headA": list(head), "jointB": j, "headB": list(tail), "radius": radius,
+                "_debug_label": f"{name} (leaf offset capsule)", "_debug_vertcount": len(vertex_ids),
+                "_debug_bone_len_world": length * raw_to_world_scale,
+                "_debug_radius_world": radius * raw_to_world_scale,
+                "_debug_clamp_note": "" if abs(radius - raw_radius) < 1e-9 else
+                                      f" (clamped from {raw_radius * raw_to_world_scale:.4f})",
+            })
+
+    # --- Cap at COLLIDER_MAX_CAPSULES: keep the ones with the most supporting vertices (most
+    # anatomically significant) if somehow still over the hard SPEC limit. ---
+    if len(capsules) > COLLIDER_MAX_CAPSULES:
+        capsules.sort(key=lambda c: c["_debug_vertcount"], reverse=True)
+        overflow = capsules[COLLIDER_MAX_CAPSULES:]
+        for oc in overflow:
+            dropped.append((oc["_debug_label"], None,
+                             f"capped at {COLLIDER_MAX_CAPSULES} capsules (ranked below cutoff by vertex count)"))
+        capsules = capsules[:COLLIDER_MAX_CAPSULES]
+
+    # Stable, readable output order: by joint A's index (roughly a skeleton traversal order).
+    capsules.sort(key=lambda c: (c["jointA"], c["jointB"]))
+    return capsules, dropped
+
+
+# =========================================================================================
 # Binary packing
 # =========================================================================================
 
@@ -954,6 +1363,61 @@ def main() -> None:
     model_matrix_row_major = build_model_matrix(new_scale, new_tx, new_ty, new_tz)
     model_matrix_col_major = mat4_to_col_major(model_matrix_row_major)
 
+    # --- Collider capsules (SPEC.md "Colliders extension (v2)") ---
+    print("\nFitting collider capsules...")
+    joint_index_by_name = {name: i for i, name in enumerate(skin.joint_names)}
+    joint_parent, joint_children = build_joint_tree(armature_node, joint_index_by_name)
+    joint_head = compute_joint_bind_heads(skin.joint_names, skin.inverse_bind, skin.bind_shape_matrix)
+    # bind_shape_matrix's own uniform scale composes with modelMatrix's uniform scale to turn
+    # a length measured in raw/model space (same space as geo.positions and the capsule
+    # endpoints below) into a world-space length -- see the section banner above
+    # fit_colliders() for why colliders are computed in raw space at all.
+    raw_to_world_scale = mat4_uniform_scale(skin.bind_shape_matrix) * new_scale
+
+    dominant_by_joint: dict[int, list[int]] = {}
+    for i in range(geo.vertex_count):
+        dominant_by_joint.setdefault(int(joints_flat[i * 4]), []).append(i)
+
+    capsules, dropped_bones = fit_colliders(
+        skin.joint_names, joint_parent, joint_children, joint_head,
+        geo.positions, dominant_by_joint, raw_to_world_scale,
+    )
+
+    print(f"  {len(capsules)} capsule(s) kept, {len(dropped_bones)} candidate bone(s)/joint(s) dropped")
+    print(f"\n  {'jointA':>6} {'jointB':>6}  {'label':58s} {'verts':>6} {'len(w)':>7} {'r(w)':>7}  note")
+    for c in capsules:
+        print(f"  {c['jointA']:6d} {c['jointB']:6d}  {c['_debug_label']:58s} "
+              f"{c['_debug_vertcount']:6d} {c['_debug_bone_len_world']:7.4f} "
+              f"{c['_debug_radius_world']:7.4f}{c['_debug_clamp_note']}")
+    print("\n  dropped:")
+    for name_a, name_b, reason in dropped_bones:
+        label = f"{name_a} -> {name_b}" if name_b else name_a
+        print(f"    {label:58s} {reason}")
+    if not (6 <= len(capsules) <= 24):
+        raise ValueError(f"fit_colliders produced {len(capsules)} capsules, expected [6,24] "
+                          f"(SPEC hard cap 24; validate_bake.py also enforces this)")
+
+    # headA/headB are written in raw/model space (see the big comment above fit_colliders()):
+    # the runtime's `palette[joint] x head` multiply is what carries them into world space
+    # each frame, and palette already has the raw->world conversion (incl. bind_shape_matrix)
+    # baked in, so a raw-space point in is what makes that multiply land correctly.
+    #
+    # radius has no such pipeline -- SPEC only defines palette/modelMatrix transforms for the
+    # two *endpoints*, and describes the final uploaded value as a plain world-space Capsule
+    # struct (`a.w` = radius, part of "a world-space collider array"). A bare scalar has no
+    # matrix to cancel out the raw-space convention the way headA/headB do, so if radius were
+    # written in the same raw space as the endpoints (as an earlier version of this script
+    # did), it would be ~100x too large to use directly (raw space is pre-bind_shape_matrix,
+    # which is a 0.01 scale here) -- e.g. a torso capsule came out with radius=16.6 on a model
+    # that's 4.5 units tall. So radius is deliberately the one field pre-converted to world
+    # units at bake time, using the SAME raw_to_world_scale used for the length thresholds
+    # above (bind_shape_matrix's uniform scale composed with modelMatrix's).
+    colliders_json = [
+        {"jointA": c["jointA"], "headA": c["headA"], "jointB": c["jointB"], "headB": c["headB"],
+         "radius": c["radius"] * raw_to_world_scale}
+        for c in capsules
+    ]
+
     # --- Pack binary sections ---
     print("Packing binary buffers...")
     positions_bytes = pack_f32(geo.positions)
@@ -986,6 +1450,7 @@ def main() -> None:
         "duration": duration,
         "modelMatrix": model_matrix_col_major,
         "buffers": layout,
+        "colliders": colliders_json,
     }
     OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(OUT_JSON, "w") as f:

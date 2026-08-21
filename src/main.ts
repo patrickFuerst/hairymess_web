@@ -5,12 +5,8 @@ import { OrbitCamera } from './engine/camera';
 import { densityCompensatedRepulsion, makeEngineConfig, type EngineConfig } from './engine/config';
 import { initWebGPU, WebGpuUnavailableError } from './engine/device';
 import { HairSim } from './engine/hairSim';
-import {
-  SPHERE_DEFAULT_STRANDS,
-  createSphereModel,
-  loadModel,
-  type HairModel,
-} from './engine/model';
+import { PointerBrush } from './engine/interaction';
+import { SPHERE_DEFAULT_STRANDS, createSphereModel, loadModel, type HairModel } from './engine/model';
 import { Renderer } from './engine/renderer';
 import { runSelftest } from './engine/selftest';
 import { Timestamps } from './engine/timestamps';
@@ -25,6 +21,35 @@ declare global {
 
 const MAX_DEVICE_PIXEL_RATIO = 2;
 
+/** session keys: the adaptive strand count, its step counter, the device-lost guard */
+const KEY_STRANDS = 'hairymess.sphereStrands';
+const KEY_DOWNSCALES = 'hairymess.downscales';
+const KEY_RELOAD_GUARD = 'hairymess.reloadGuard';
+
+/** adaptive quality: frames to warm up before judging, and the budget it aims at */
+const ADAPTIVE_FRAMES = 120;
+const ADAPTIVE_BUDGET_MS = 14;
+const ADAPTIVE_TARGET_MS = 12;
+const ADAPTIVE_MAX_STEPS = 2;
+const ADAPTIVE_MIN_STRANDS = 10_000;
+
+function session(key: string): string | null {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null; // private mode / storage disabled — the features degrade to off
+  }
+}
+
+function setSession(key: string, value: string | null): void {
+  try {
+    if (value === null) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, value);
+  } catch {
+    /* ignore */
+  }
+}
+
 async function main(): Promise<void> {
   const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement | null;
   if (!canvas) throw new Error('#gpu-canvas is missing from the document');
@@ -33,7 +58,15 @@ async function main(): Promise<void> {
   const wantSphere = query.get('model') === 'sphere';
   const wantSelftest = query.has('selftest');
   const strandsOverride = Number.parseInt(query.get('strands') ?? '', 10);
-  const sphereStrands = Number.isFinite(strandsOverride) ? strandsOverride : SPHERE_DEFAULT_STRANDS;
+  const explicitStrands = Number.isFinite(strandsOverride);
+  // an adaptive downscale from an earlier run of this session wins over the default,
+  // but never over an explicit ?strands=
+  const rememberedStrands = Number.parseInt(session(KEY_STRANDS) ?? '', 10);
+  const sphereStrands = explicitStrands
+    ? strandsOverride
+    : Number.isFinite(rememberedStrands)
+      ? rememberedStrands
+      : SPHERE_DEFAULT_STRANDS;
 
   // ---------------------------------------------------------------- device
   let gpu;
@@ -48,7 +81,7 @@ async function main(): Promise<void> {
     showBanner(message);
     return;
   }
-  const { device, context, format, hasTimestamps } = gpu;
+  const { device, context, format, hasTimestamps, canPullInVertexStage } = gpu;
 
   let bannerShown = false;
   const reportFatal = (message: string): void => {
@@ -62,7 +95,18 @@ async function main(): Promise<void> {
     reportFatal(`WebGPU error: ${event.error.message}`);
   };
   void device.lost.then((info) => {
-    if (info.reason !== 'destroyed') reportFatal(`WebGPU device lost: ${info.message}`);
+    if (info.reason === 'destroyed') return;
+    console.warn(`WebGPU device lost: ${info.message}`);
+    // One automatic recovery attempt per session. The guard is cleared once a run has
+    // survived its first frames, so a genuine crash loop shows the banner instead of
+    // reloading for ever.
+    if (session(KEY_RELOAD_GUARD) === '1') {
+      reportFatal(`WebGPU device lost: ${info.message}`);
+      return;
+    }
+    setSession(KEY_RELOAD_GUARD, '1');
+    console.warn('Reloading once to recover the device.');
+    location.reload();
   });
 
   // ---------------------------------------------------------------- model
@@ -106,6 +150,13 @@ async function main(): Promise<void> {
       : modelName === 'sphere'
         ? 'gradient'
         : 'alternating';
+  if (!canPullInVertexStage) {
+    params.renderMode = 'lines';
+    console.warn(
+      'This device does not allow storage buffers in the vertex stage ' +
+        '(maxStorageBuffersInVertexStage = 0) — the hair falls back to the line path.'
+    );
+  }
 
   const sim = new HairSim(device, model, cfg, params.colorMode, reportFatal);
 
@@ -118,14 +169,16 @@ async function main(): Promise<void> {
       (params.numIterations * cfg.particlesPerStrand) / NUM_HAIR_PARTICLES
     );
   }
-  const renderer = new Renderer(device, format, sim, cfg, reportFatal);
+  const renderer = new Renderer(device, format, sim, cfg, canPullInVertexStage, reportFatal);
   const camera = new OrbitCamera(canvas, [10, 15, 10]);
+  const brush = new PointerBrush(canvas);
   const timestamps = hasTimestamps ? new Timestamps(device) : null;
 
   const hud = new Hud();
   hud.setCounts(sim.numParticles, sim.numStrands);
   createGui(params, {
     model: modelName,
+    ribbonsAvailable: canPullInVertexStage,
     onModelChange: (next) => {
       const url = new URL(location.href);
       url.searchParams.set('model', next);
@@ -138,6 +191,7 @@ async function main(): Promise<void> {
     `HairyMess: model "${model.name}" — ${sim.numStrands} strands (${sim.paddedStrands} padded), ` +
       `${sim.numParticles} particles at ${cfg.particlesPerStrand}/strand, ${model.jointCount} joints, ` +
       `${model.frameCount} frames, colors ${params.colorMode}, ` +
+      `render ${params.renderMode}, ${model.colliders.length} model collider(s), ` +
       `timestamps ${hasTimestamps ? 'on' : 'unavailable'}`
   );
 
@@ -157,7 +211,8 @@ async function main(): Promise<void> {
   // ---------------------------------------------------------------- one frame
   function runFrame(dt: number): void {
     syncCanvasSize();
-    sim.update(params, dt);
+    const aspect = canvas!.height > 0 ? canvas!.width / canvas!.height : 1;
+    sim.update(params, dt, brush.update(camera, model, aspect, dt));
 
     const encoder = device.createCommandEncoder({ label: 'frame' });
     sim.encode(encoder, params, timestamps?.computePassWrites);
@@ -171,6 +226,43 @@ async function main(): Promise<void> {
     const slot = timestamps ? timestamps.resolve(encoder) : -1;
     device.queue.submit([encoder.finish()]);
     if (timestamps) timestamps.read(slot);
+  }
+
+  // ---------------------------------------------------------------- adaptive quality
+  // Only the FurryBall, and only when the strand count was not asked for explicitly:
+  // after a warm-up, a GPU frame heavier than the budget rescales the tessellation and
+  // reloads once. The chosen count is remembered for the rest of the session.
+  const downscales = Number.parseInt(session(KEY_DOWNSCALES) ?? '0', 10) || 0;
+  const adaptiveEnabled =
+    modelName === 'sphere' &&
+    !explicitStrands &&
+    !wantSelftest &&
+    timestamps !== null &&
+    downscales < ADAPTIVE_MAX_STEPS;
+
+  function considerDownscale(): void {
+    const timings = timestamps?.timings;
+    const total = (timings?.simMs ?? 0) + (timings?.renderMs ?? 0);
+    if (!(total > 0)) return; // timestamps never produced a reading
+    if (total <= ADAPTIVE_BUDGET_MS) {
+      console.log(
+        `adaptive quality: ${total.toFixed(1)} ms/frame is within budget, ` +
+          `staying at ${sim.numStrands} strands`
+      );
+      return; // the counter only ever counts actual downscales
+    }
+    const next = Math.max(
+      ADAPTIVE_MIN_STRANDS,
+      Math.round(sim.numStrands * (ADAPTIVE_TARGET_MS / total))
+    );
+    if (next >= sim.numStrands) return;
+    console.warn(
+      `adaptive quality: ${total.toFixed(1)} ms/frame exceeds ${ADAPTIVE_BUDGET_MS} ms — ` +
+        `rebuilding at ~${next} strands (was ${sim.numStrands}) and reloading`
+    );
+    setSession(KEY_STRANDS, String(next));
+    setSession(KEY_DOWNSCALES, String(downscales + 1));
+    location.reload();
   }
 
   // ---------------------------------------------------------------- input
@@ -192,12 +284,17 @@ async function main(): Promise<void> {
   // ---------------------------------------------------------------- loop
   let previous = performance.now();
   let running = true;
+  let frames = 0;
   function loop(now: number): void {
     if (!running) return;
     const dt = Math.min((now - previous) / 1000, MAX_DT);
     previous = now;
     runFrame(Math.max(dt, 1e-4));
     hud.tick(timestamps?.timings);
+    frames++;
+    // the run is healthy — let a future device loss try its one reload again
+    if (frames === 5) setSession(KEY_RELOAD_GUARD, null);
+    if (adaptiveEnabled && frames === ADAPTIVE_FRAMES) considerDownscale();
     requestAnimationFrame(loop);
   }
 

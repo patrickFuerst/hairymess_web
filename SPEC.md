@@ -228,6 +228,18 @@ Sphere fallback (`?model=sphere` or fetch failure): UV sphere radius 4 center (0
 grid ≈ 16k verts, identity animation (single identity palette, jointCount 1, all weights joint 0),
 same code path.
 
+### Colliders extension (v2, optional section in the manifest)
+
+`beast.json` MAY carry a `"colliders"` array of auto-fitted capsules in **bind/model space**:
+```json
+"colliders": [ { "jointA": 3, "headA": [x,y,z], "jointB": 5, "headB": [x,y,z], "radius": r }, ... ]
+```
+Runtime skins each endpoint with weight 1 to its joint (`palette[jointA] × headA`, `palette[jointB]
+× headB`), applies modelMatrix, and uploads a world-space collider array each frame:
+`array<Capsule>` where `Capsule = { a: vec4f (xyz + radius in w), b: vec4f (xyz + velocity flag in
+w unused for skinned capsules) }`. A sphere is a degenerate capsule (a == b). Engines must accept
+manifests without the section (floor-only collision). Cap: ≤ 24 capsules.
+
 ## Params defaults (from original settings.xml)
 
 velocityDamping 0.9847, numIterations 30, stiffness 1.0, friction 0.0663, repulsion 117.35,

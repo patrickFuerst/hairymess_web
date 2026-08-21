@@ -26,6 +26,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
     pos = hit.pos;
     velocity = hit.vel;
 
+    // body capsules, resolved right alongside the ground plane
+    let body = resolveColliders(pos, velocity);
+    pos = body.pos;
+    velocity = body.vel;
+
     // follow-the-leader damping towards the next vertex down the strand
     var distanceToNext = vec3f(0.0);
     if (s.vertexIndexInStrand < NUM_HAIR_PARTICLES - 1u) {

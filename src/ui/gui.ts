@@ -1,5 +1,5 @@
 import GUI from 'lil-gui';
-import type { SimParams } from '../params';
+import type { RenderMode, SimParams } from '../params';
 
 export type ModelName = 'beast' | 'sphere';
 
@@ -10,6 +10,8 @@ export interface GuiHooks {
   onModelChange: (model: ModelName) => void;
   /** re-initialises the particle buffer with the new colour scheme */
   onColorModeChange: () => void;
+  /** false on devices without vertex-stage storage buffers: ribbons are unavailable */
+  ribbonsAvailable?: boolean;
   /** any other parameter changed */
   onChange?: () => void;
 }
@@ -33,9 +35,15 @@ export function createGui(params: SimParams, hooks?: GuiHooks): GUI {
       .name('colors')
       .onChange(() => hooks.onColorModeChange());
   }
+
+  const modes: RenderMode[] = hooks?.ribbonsAvailable === false ? ['lines'] : ['ribbons', 'lines'];
+  gui.add(params, 'renderMode', modes).name('render');
+  gui.add(params, 'strandWidth', 0.5, 4, 0.1).name('strand width');
+  gui.add(params, 'shading').name('shading');
   gui.add(params, 'useFilter').name('use filter');
   gui.add(params, 'drawBoundingBox').name('draw bounding box');
   gui.add(params, 'drawVoxelGrid').name('draw voxel grid');
+  gui.add(params, 'drawColliders').name('draw colliders');
   gui.add(params, 'drawFur').name('draw fur');
   gui.add(params, 'playAnimation').name('play animation');
 
