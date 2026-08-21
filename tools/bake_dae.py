@@ -640,27 +640,58 @@ def cpu_skin_frame(
 
 
 # =========================================================================================
-# modelMatrix: Z-up -> Y-up axis fix, then uniform scale + translate.
+# modelMatrix: axis fix, then uniform scale + translate.
 #
-# IMPORTANT: the normalization (scale + translate) is derived from the UNION of axis-fixed
-# bounds across ALL frames of the animation, not from frame 0 alone. An earlier version of
-# this script normalized against frame 0 only; the engine team found that mid-stride frames
-# then sink up to ~3 world units below the floor (frame 0 happens to be a relatively "tall,
-# neutral" pose in this walk cycle, not representative of the full cycle's Y extent -- see
-# the diagnostic table printed in main()). Using the union means: every frame's lowest point
-# is guaranteed >= y=0, the tallest point across the whole cycle is exactly y=4.5, and only
-# the frame(s) that touch those extremes will exactly reach 0 / 4.5 -- other frames legally
-# float above the floor and top out below 4.5. That's the intended, physically-correct
-# behavior for a walk cycle (e.g. a crouch phase shouldn't be stretched to full height).
+# AXIS FIX -- despite the DAE's <up_axis> tag reading Z_UP, this content's baked joint/mesh
+# data is empirically already Y-up, and the axis fix must be IDENTITY (no rotation).
+#
+# How we know: with the previous Rx(-90) "Z-up -> Y-up" fix in place, the union-of-all-frames
+# axis-fixed bounds came out X[-0.4854,0.5866] Y[-0.6105,0.6524] Z[-1.7150,0.0014] -- i.e. the
+# *world Z* axis (horizontal under a Y-up convention) carried the largest extent (1.72), which
+# visually reads as the character lying on its side. Undoing that rotation to recover the raw
+# per-frame skinned (model-space) bounds gives:
+#     model X in [-0.4854, 0.5866]  extent 1.072   (roughly centered on 0 -> left/right)
+#     model Y in [-0.0014, 1.7150]  extent 1.716   (starts almost exactly at 0 -> up/down)
+#     model Z in [-0.6105, 0.6524]  extent 1.263   (roughly centered on 0 -> front/back)
+# Model Y is both the largest extent (consistent with height dominating for an upright
+# bipedal walker -- this rig has full per-finger hands, not a quadruped) *and* its minimum
+# sits almost exactly at 0, the classic signature of a "feet on the ground" vertical axis in
+# rest/bind-ish data. Both signals independently point the same way: the raw DAE data is
+# already Y-up, and Blender's Collada exporter must have baked that orientation into the
+# joint hierarchy and animation curves directly without actually needing (or the <up_axis>
+# tag not accurately reflecting) a separate Z-up-to-Y-up conversion. So: model axes already
+# equal world axes here -- no rotation, and definitely no reason to introduce a mirror.
 # =========================================================================================
 
-# axisFix: rotate -90 deg about X  =>  y' = z, z' = -y  (verified == Rx(-90deg)).
-AXIS_FIX = [
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-    0.0, -1.0, 0.0, 0.0,
-    0.0, 0.0, 0.0, 1.0,
-]
+AXIS_FIX = mat4_identity()
+
+
+def _mat3_determinant(m: list[float]) -> float:
+    a, b, c = m[0], m[1], m[2]
+    d, e, f = m[4], m[5], m[6]
+    g, h, i = m[8], m[9], m[10]
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
+# Handedness sanity check: AXIS_FIX must be a proper (non-mirroring) transform. For the
+# current identity this is trivially true, but this guards against a future edit here
+# accidentally introducing a reflection (determinant -1) instead of a rotation (+1).
+_axis_fix_det = _mat3_determinant(AXIS_FIX)
+assert abs(_axis_fix_det - 1.0) < 1e-9, (
+    f"AXIS_FIX has determinant {_axis_fix_det:.6f}, expected +1 (a mirror would flip winding "
+    f"and turn the mesh inside out from the renderer's point of view)")
+
+
+# IMPORTANT (unrelated to the axis fix above): the scale + translate normalization is
+# derived from the UNION of bounds across ALL frames of the animation, not from frame 0
+# alone. An earlier version of this script normalized against frame 0 only; the engine team
+# found that mid-stride frames then sink up to ~3 world units below the floor (frame 0
+# happens to be a relatively "tall, neutral" pose in this walk cycle, not representative of
+# the full cycle's Y extent). Using the union means: every frame's lowest point is
+# guaranteed >= y=0, the tallest point across the whole cycle is exactly y=4.5, and only the
+# frame(s) that touch those extremes will exactly reach 0 / 4.5 -- other frames legitimately
+# float above the floor and top out below 4.5 (e.g. a crouch phase shouldn't be stretched to
+# full height).
 
 # Axis-fixed (but not yet scaled/translated) bounding box of one frame's skinned mesh.
 Bounds = namedtuple("Bounds", "min_x max_x min_y max_y min_z max_z")
@@ -710,6 +741,15 @@ def world_y_bounds(bounds: Bounds, scale: float, ty: float) -> tuple[float, floa
     permutation+sign-flip, scale/translate are diagonal), so world Y bounds can be derived
     directly from the axis-fixed Y bounds without re-skinning or re-transforming vertices."""
     return bounds.min_y * scale + ty, bounds.max_y * scale + ty
+
+
+def world_bounds_full(bounds: Bounds, scale: float, tx: float, ty: float, tz: float) -> Bounds:
+    """Same idea as world_y_bounds() but all three axes, for reporting proportions."""
+    return Bounds(
+        min_x=bounds.min_x * scale + tx, max_x=bounds.max_x * scale + tx,
+        min_y=bounds.min_y * scale + ty, max_y=bounds.max_y * scale + ty,
+        min_z=bounds.min_z * scale + tz, max_z=bounds.max_z * scale + tz,
+    )
 
 
 # =========================================================================================
@@ -780,10 +820,9 @@ def main() -> None:
 
     asset = root.find("asset")
     up_axis = asset.findtext("up_axis", default="Y_UP")
-    print(f"  up_axis={up_axis}")
-    if up_axis != "Z_UP":
-        print(f"  WARNING: expected Z_UP, got {up_axis} -- the hardcoded axisFix "
-              f"(rotate -90deg about X) assumes Z_UP source data", file=sys.stderr)
+    print(f"  up_axis={up_axis} (informational only -- NOT used to choose the axis fix; "
+          f"see the AXIS_FIX comment above main(): this content is empirically Y-up in its "
+          f"baked joint/mesh data regardless of what this tag says, so AXIS_FIX is identity)")
 
     print("Parsing geometry (positions/normals/indices)...")
     geo = parse_geometry(root, ids)
@@ -863,12 +902,48 @@ def main() -> None:
         max_z=max(b.max_z for b in per_frame_bounds),
     )
     new_scale, new_tx, new_ty, new_tz = compute_scale_translate(union_bounds)
-    print(f"\n  union ({frame_count}-frame) axis-fixed bounds: "
-          f"X[{union_bounds.min_x:.4f},{union_bounds.max_x:.4f}] "
-          f"Y[{union_bounds.min_y:.4f},{union_bounds.max_y:.4f}] "
-          f"Z[{union_bounds.min_z:.4f},{union_bounds.max_z:.4f}]")
+    ux_extent = union_bounds.max_x - union_bounds.min_x
+    uy_extent = union_bounds.max_y - union_bounds.min_y
+    uz_extent = union_bounds.max_z - union_bounds.min_z
+    print(f"\n  union ({frame_count}-frame) axis-fixed bounds (pre-scale), per axis:")
+    print(f"    X[{union_bounds.min_x:8.4f},{union_bounds.max_x:8.4f}]  extent={ux_extent:.4f}")
+    print(f"    Y[{union_bounds.min_y:8.4f},{union_bounds.max_y:8.4f}]  extent={uy_extent:.4f}  (up axis, drives scale)")
+    print(f"    Z[{union_bounds.min_z:8.4f},{union_bounds.max_z:8.4f}]  extent={uz_extent:.4f}")
     print(f"  NEW modelMatrix (union-normalized): scale={new_scale:.6f} "
           f"translate=({new_tx:.4f},{new_ty:.4f},{new_tz:.4f})")
+
+    frame0_world = world_bounds_full(per_frame_bounds[0], new_scale, new_tx, new_ty, new_tz)
+    print(f"\n  frame-0 WORLD bounds (after full modelMatrix) -- expect height~4.5, "
+          f"width/depth smaller:")
+    print(f"    X[{frame0_world.min_x:8.4f},{frame0_world.max_x:8.4f}]  "
+          f"width  ={frame0_world.max_x - frame0_world.min_x:.4f}")
+    print(f"    Y[{frame0_world.min_y:8.4f},{frame0_world.max_y:8.4f}]  "
+          f"height ={frame0_world.max_y - frame0_world.min_y:.4f}")
+    print(f"    Z[{frame0_world.min_z:8.4f},{frame0_world.max_z:8.4f}]  "
+          f"depth  ={frame0_world.max_z - frame0_world.min_z:.4f}")
+
+    # --- Facing direction: report only, do not act on it (no rotation is applied here).
+    # Front-back is whichever horizontal axis has the ~1.26-unit extent -- with AXIS_FIX now
+    # identity, that's model/world Z. Two independent signals, both weak/near-symmetric (as
+    # expected for an in-place walk cycle, where limb swing is roughly symmetric fore/aft): ---
+    z_center = (union_bounds.min_z + union_bounds.max_z) / 2.0
+    print(f"\n  [facing] front-back axis = world Z (union extent {uz_extent:.4f} matches the "
+          f"'~1.26' axis). Union Z center offset from 0: {z_center:+.4f} "
+          f"({abs(z_center) / uz_extent * 100:.1f}% of the extent -- ", end="")
+    print("too small to call a direction from this alone)" if abs(z_center) < 0.05 * uz_extent
+          else f"leans toward {'+Z' if z_center > 0 else '-Z'})")
+
+    world0 = compute_world_transforms_for_frame(armature_node, 0, anim)
+    hips_key = next((n for n in ("BeastBaseMesh_Hips",) if n in world0), None)
+    head_key = next((n for n in ("BeastBaseMesh_Head", "BeastBaseMesh_HeadTop_End") if n in world0), None)
+    if hips_key and head_key:
+        hips_z = world0[hips_key][11]  # row-major translation.z
+        head_z = world0[head_key][11]
+        dz = head_z - hips_z
+        print(f"  [facing] secondary signal, frame 0: {head_key}.z - {hips_key}.z = {dz:+.4f} "
+              f"({'head sits toward +Z of hips' if dz > 0.001 else 'head sits toward -Z of hips' if dz < -0.001 else 'head directly above hips in Z'})")
+    else:
+        print("  [facing] secondary signal skipped: Hips/Head joint not found by expected name")
 
     print("\n  per-frame world Y bounds under the NEW union-normalized modelMatrix:")
     print(f"  {'frame':>5} {'minY':>9} {'maxY':>9}")

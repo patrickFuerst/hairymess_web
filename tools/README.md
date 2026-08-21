@@ -89,3 +89,14 @@ across frames.
   stays below the max height, which is correct — it shouldn't be stretched to
   fill it). `bake_dae.py` prints a per-frame minY/maxY table under both the old
   and new normalization so a regression here is easy to spot again.
+- The axis fix applied before that scale/translate (`AXIS_FIX` in `bake_dae.py`)
+  is the **identity** — no rotation — even though the DAE's `<up_axis>` tag reads
+  `Z_UP`. That tag turned out not to reflect the actual baked data: an earlier
+  version rotated -90° about X (a standard Z-up→Y-up fix), which put the
+  skeleton's largest extent (1.72 units) into the horizontal plane and rendered
+  the character tipped onto its side. The raw per-frame skinned bounds are
+  already Y-up (model Y is both the largest extent, consistent with height
+  dominating for this upright bipedal rig, and its minimum sits almost exactly
+  at 0, the signature of a "feet on the ground" axis) — Blender's exporter must
+  have baked the orientation into the joint/animation data directly. See the
+  `AXIS_FIX` comment block in `bake_dae.py` for the full numeric evidence.
